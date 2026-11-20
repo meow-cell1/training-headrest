@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block body %}
+<h1 class="mb-2 text-3xl font-semibold tracking-tight">Aktivitas Peserta</h1>
+<p class="mb-6 text-sm text-zinc-500">Riwayat membuka materi serta durasi Pre Test, membaca materi, dan Post Test. Lama membaca dihitung sejak peserta membuka materi pertama sampai memulai Post Test.</p>
+<form class="mb-4 flex flex-wrap gap-2"><input name="q" value="{{ s }}" placeholder="Cari nama atau NIK" class="min-w-40 flex-1 rounded-xl border border-zinc-200 bg-white px-3.5 py-2.5 text-sm outline-none focus:border-indigo-500">
+<select name="kind" class="rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm"><option value="">Semua aktivitas</option>{% for key,v in EVENT.items() %}<option value="{{ key }}" {{ 'selected' if key==k }}>{{ v }}</option>{% endfor %}</select>
+<button class="rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-sm font-medium hover:bg-zinc-50">Filter</button>
+<a href="/admin/riwayat.xlsx" class="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-emerald-700">Unduh Excel</a></form>
+<div class="overflow-x-auto rounded-2xl border border-zinc-200 bg-white shadow-sm"><table class="w-full text-sm"><thead class="bg-zinc-50 text-left text-xs uppercase tracking-wider text-zinc-500"><tr>
+<th class="p-3.5">Waktu</th><th class="p-3.5">Nama</th><th class="p-3.5">NIK</th><th class="p-3.5">Aktivitas</th><th class="p-3.5">Detail</th><th class="p-3.5">Durasi</th></tr></thead><tbody>
+{% for e in rows %}<tr class="border-t border-zinc-100"><td class="whitespace-nowrap p-3.5 text-zinc-500">{{ e.at }}</td><td class="p-3.5 font-medium">{{ e.name }}</td><td class="p-3.5 text-zinc-500">{{ e.nik or '-' }}</td>
+<td class="p-3.5"><span class="rounded-full px-2.5 py-0.5 text-xs font-medium {{ {'pre':'bg-amber-50 text-amber-700','post':'bg-indigo-50 text-indigo-700','buka':'bg-sky-50 text-sky-700','baca':'bg-emerald-50 text-emerald-700'}[e.kind] }}">{{ EVENT[e.kind] }}</span></td>
+<td class="p-3.5 text-zinc-600">{{ e.detail }}</td><td class="whitespace-nowrap p-3.5 font-medium">{{ e.secs|dur if e.secs is not none else '-' }}</td></tr>
+{% else %}<tr><td colspan="6" class="p-8 text-center text-zinc-400">Belum ada aktivitas</td></tr>{% endfor %}</tbody></table></div>{% endblock %}

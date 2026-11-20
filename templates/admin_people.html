@@ -1,0 +1,16 @@
+{% extends "base.html" %}{% block body %}
+{% set inp = "w-full rounded-xl border border-zinc-200 bg-white px-3.5 py-2.5 text-sm outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100" %}
+<h1 class="mb-2 text-3xl font-semibold tracking-tight">Daftar Peserta</h1>
+<p class="mb-6 text-sm text-zinc-500">Peserta memilih nama dari daftar ini, lalu mengisi NIK yang harus sama dengan yang Anda masukkan di sini.</p>
+<form method="post" class="grid gap-3 rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm sm:grid-cols-[1fr_1fr_auto]">
+<input name="name" required placeholder="Nama peserta" class="{{ inp }}"><input name="nik" required placeholder="NIK" class="{{ inp }}">
+<button class="rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-indigo-700">Tambah</button></form>
+<details class="mt-4 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm"><summary class="cursor-pointer text-sm font-medium">Tambah banyak sekaligus (tempel dari Excel)</summary>
+<form method="post" class="mt-3"><textarea name="bulk" rows="5" placeholder="Satu baris satu peserta: Nama, NIK&#10;Budi Santoso, 100234&#10;Sari Dewi; 100235" class="{{ inp }}"></textarea>
+<p class="mt-1 text-xs text-zinc-500">Pemisah boleh koma, titik koma, atau tab (hasil copy dari 2 kolom Excel). NIK yang sudah ada dilewati.</p>
+<button class="mt-3 rounded-xl bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-zinc-800">Tambahkan semua</button></form></details>
+<h2 class="mb-3 mt-8 text-lg font-semibold">Peserta ({{ people|length }})</h2>
+<div class="overflow-x-auto rounded-2xl border border-zinc-200 bg-white shadow-sm"><table class="w-full text-sm"><thead class="bg-zinc-50 text-left text-xs uppercase tracking-wider text-zinc-500"><tr><th class="p-3.5">Nama</th><th class="p-3.5">NIK</th><th class="p-3.5"></th></tr></thead><tbody>
+{% for p in people %}<tr class="border-t border-zinc-100"><td class="p-3.5 font-medium">{{ p.name }}</td><td class="p-3.5 text-zinc-500">{{ p.nik }}</td>
+<td class="p-3.5 text-right"><form method="post" action="/admin/peserta/hapus/{{ p.id }}" data-confirm="Hapus peserta {{ p.name }}? Riwayat tesnya tetap tersimpan." data-ok-text="Hapus"><button class="text-red-600 hover:underline">Hapus</button></form></td></tr>
+{% else %}<tr><td colspan="3" class="p-8 text-center text-zinc-400">Belum ada peserta</td></tr>{% endfor %}</tbody></table></div>{% endblock %}

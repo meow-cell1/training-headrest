@@ -1,0 +1,15 @@
+{% extends "base.html" %}{% block body %}
+<h1 class="mb-6 text-3xl font-semibold tracking-tight">Riwayat Pengerjaan</h1>
+<div class="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
+{% for lbl,val in [('Total pengerjaan',total),('Peserta',people),('Rata-rata Pre',(st.pre.m|int if st.pre else '-')),('Rata-rata Post',(st.post.m|int if st.post else '-'))] %}
+<div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm"><p class="text-xs text-zinc-500">{{ lbl }}</p><p class="mt-1 text-2xl font-semibold">{{ val }}</p></div>{% endfor %}</div>
+<form class="mb-4 flex flex-wrap gap-2"><input name="q" value="{{ s }}" placeholder="Cari nama" class="min-w-40 flex-1 rounded-xl border border-zinc-200 bg-white px-3.5 py-2.5 text-sm outline-none focus:border-indigo-500">
+<select name="phase" class="rounded-xl border border-zinc-200 bg-white px-3 py-2.5 text-sm"><option value="">Semua tipe</option>{% for k,v in PHASE.items() %}<option value="{{ k }}" {{ 'selected' if k==ph }}>{{ v }}</option>{% endfor %}</select>
+<button class="rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-sm font-medium hover:bg-zinc-50">Filter</button>
+<a href="/admin/riwayat.xlsx?phase={{ ph }}&q={{ s }}" class="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-emerald-700">Unduh Excel</a></form>
+<div class="overflow-x-auto rounded-2xl border border-zinc-200 bg-white shadow-sm"><table class="w-full text-sm"><thead class="bg-zinc-50 text-left text-xs uppercase tracking-wider text-zinc-500"><tr>
+<th class="p-3.5">Tanggal</th><th class="p-3.5">Nama</th><th class="p-3.5">NIK</th><th class="p-3.5">Tipe</th><th class="p-3.5">Level</th><th class="p-3.5">Skor</th><th class="p-3.5">NG lolos</th><th class="p-3.5">Durasi</th><th class="p-3.5">Status</th><th class="p-3.5"></th></tr></thead><tbody>
+{% for r in rows %}{% set ok = r.score>=PASS and (r.esc or 0)==0 %}<tr class="border-t border-zinc-100"><td class="whitespace-nowrap p-3.5 text-zinc-500">{{ r.created }}</td><td class="p-3.5 font-medium">{{ r.name }}</td><td class="p-3.5 text-zinc-500">{{ r.nik or '-' }}</td><td class="p-3.5">{{ PHASE[r.phase] }}</td><td class="p-3.5 text-zinc-500">{{ levels[r.level][0] if r.level in levels else '-' }}</td><td class="p-3.5 font-semibold">{{ r.score }}%</td><td class="p-3.5 {{ 'font-semibold text-red-600' if r.esc }}">{{ r.esc or 0 }}</td><td class="whitespace-nowrap p-3.5 text-zinc-500">{{ (r.dur|dur) if r.dur else '-' }}</td>
+<td class="p-3.5"><span class="rounded-full px-2.5 py-0.5 text-xs font-medium {{ 'bg-emerald-50 text-emerald-700' if ok else 'bg-red-50 text-red-700' }}">{{ 'Lulus' if ok else 'Belum' }}</span></td>
+<td class="p-3.5"><a href="/hasil/{{ r.id }}" class="text-indigo-600 hover:underline">Detail</a></td></tr>
+{% else %}<tr><td colspan="10" class="p-8 text-center text-zinc-400">Belum ada data</td></tr>{% endfor %}</tbody></table></div>{% endblock %}

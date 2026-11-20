@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block body %}
+<div class="rounded-2xl border border-zinc-200 bg-white p-8 text-center shadow-sm">
+<p class="text-sm text-zinc-500">{{ label }} &middot; {{ a.name }} &middot; Level {{ levels[a.level][0] if a.level in levels else '-' }} &middot; {{ a.created }}</p>
+<p class="mt-5 text-7xl font-semibold tracking-tight {{ 'text-emerald-600' if passed else 'text-red-600' }}">{{ a.score }}%</p>
+<span class="mt-4 inline-block rounded-full px-4 py-1.5 text-sm font-semibold tracking-wide {{ 'bg-emerald-50 text-emerald-700' if passed else 'bg-red-50 text-red-700' }}">{{ 'LULUS · KOMPETEN' if passed else 'BELUM LULUS · PERLU RETRAINING' }}</span>
+<p class="mt-3 text-sm text-zinc-500">Syarat lulus: skor &ge; {{ PASS }}% dan tidak ada NG lolos</p>
+<div class="mt-7 grid grid-cols-2 gap-3 md:grid-cols-4">
+{% for val,lbl,bad in [(a.esc or 0,'NG lolos (kritis)',true),(a.rej or 0,'OK dianggap NG',false),(a.kw or 0,'Jenis NG salah',false),((('%.1f'|format(a.avgt or 0))~' dtk'),'Rata-rata waktu',false)] %}
+<div class="rounded-xl bg-zinc-50 p-4"><p class="text-2xl font-semibold {{ 'text-red-600' if bad and val else '' }}">{{ val }}</p><p class="mt-1 text-xs text-zinc-500">{{ lbl }}</p></div>{% endfor %}</div>
+<div class="mt-7">{% if session.admin %}<a href="/admin" class="rounded-xl bg-zinc-900 px-6 py-3 text-sm font-medium text-white hover:bg-zinc-800">Kembali</a>
+{% elif a.phase=='pre' %}<a href="/" class="rounded-xl bg-indigo-600 px-6 py-3 text-sm font-medium text-white hover:bg-indigo-700">Lanjut ke Materi</a>
+{% else %}<a href="/selesai" class="rounded-xl bg-indigo-600 px-6 py-3 text-sm font-medium text-white hover:bg-indigo-700">Selesai &middot; Kembali ke Awal</a>{% endif %}</div></div>
+{% if review %}<h2 class="mb-3 mt-10 text-lg font-semibold">Pembahasan</h2><div class="space-y-3">
+{% for d in det %}
+<div class="rounded-2xl border bg-white p-5 {{ 'border-emerald-200' if d.good else 'border-red-200' }}">
+<div class="flex items-start justify-between gap-3"><p class="font-medium">{{ loop.index }}. {{ d.text }}</p>
+<span class="shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium {{ 'bg-emerald-50 text-emerald-700' if d.good else 'bg-red-50 text-red-700' }}">{{ 'Benar' if d.good else 'Salah' }}</span></div>
+{% if d.image %}<img src="/file/{{ d.image }}" alt="" class="mt-3 max-h-44 rounded-xl border border-zinc-200">{% endif %}
+<p class="mt-3 text-sm text-zinc-500">Jawaban Anda: <span class="font-medium {{ 'text-emerald-700' if d.good else 'text-red-700' }}">{{ d.yours }}</span></p>
+{% if not d.good %}<p class="text-sm text-zinc-500">Jawaban benar: <span class="font-medium text-emerald-700">{{ d.key }}</span></p>
+{% if d.explain %}<div class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span class="font-medium">Penjelasan:</span> {{ d.explain }}</div>{% endif %}{% endif %}
+</div>{% endfor %}</div>{% endif %}{% endblock %}

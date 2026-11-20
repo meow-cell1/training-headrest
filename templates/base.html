@@ -1,0 +1,35 @@
+<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Headrest Training</title>
+{% if local_css %}<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">{% else %}<script src="https://cdn.tailwindcss.com"></script>{% endif %}
+<style>@keyframes pop{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}.pop{animation:pop .2s ease-out}</style>
+</head>
+<body class="min-h-screen bg-zinc-50 text-zinc-900 antialiased">
+<header class="sticky top-0 z-20 border-b border-zinc-200 bg-white/80 backdrop-blur">
+<div class="mx-auto flex h-14 max-w-4xl items-center justify-between px-5">
+<a href="/" class="flex items-center gap-2.5 font-semibold tracking-tight">
+<span class="grid h-8 w-8 place-items-center rounded-lg bg-indigo-600 text-white"><svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z"/></svg></span>
+Headrest Training</a>
+{% if session.admin %}<a href="/admin/logout" class="text-sm text-zinc-500 hover:text-zinc-900">Keluar</a>{% else %}<a href="/admin/login" class="text-sm text-zinc-500 hover:text-zinc-900">Admin</a>{% endif %}
+</div></header>
+<main class="mx-auto max-w-4xl px-5 py-10">
+{% if session.admin and request.path.startswith('/admin') %}
+<nav class="mb-8 inline-flex max-w-full gap-1 overflow-x-auto rounded-xl border border-zinc-200 bg-white p-1 text-sm">
+{% for href,t in [('/admin','Riwayat'),('/admin/aktivitas','Aktivitas'),('/admin/peserta','Peserta'),('/admin/soal/pre','Soal Pre'),('/admin/soal/post','Soal Post'),('/admin/materi','Materi')] %}
+<a href="{{ href }}" class="whitespace-nowrap rounded-lg px-3.5 py-1.5 font-medium {{ 'bg-zinc-900 text-white' if request.path==href else 'text-zinc-600 hover:bg-zinc-100' }}">{{ t }}</a>{% endfor %}</nav>{% endif %}
+{% for m in get_flashed_messages() %}<div class="mb-5 rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm text-indigo-800">{{ m }}</div>{% endfor %}
+{% block body %}{% endblock %}
+</main>
+<!-- Modal konfirmasi buatan sendiri -->
+<div id="cm" class="fixed inset-0 z-50 hidden items-center justify-center bg-zinc-900/50 p-4 backdrop-blur-sm">
+<div class="pop w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl">
+<h3 class="text-lg font-semibold">Konfirmasi</h3><p id="cmMsg" class="mt-2 text-sm text-zinc-600"></p>
+<div class="mt-6 flex justify-end gap-2"><button id="cmNo" type="button" class="rounded-xl border border-zinc-200 px-4 py-2.5 text-sm font-medium hover:bg-zinc-50">Batal</button>
+<button id="cmOk" type="button" class="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-700">Ya, lanjut</button></div></div></div>
+<script>
+const cm=document.getElementById('cm');
+function ask(msg,ok,okText){document.getElementById('cmMsg').textContent=msg;const b=document.getElementById('cmOk');b.textContent=okText||'Ya, lanjut';cm.classList.replace('hidden','flex');
+ const hide=()=>cm.classList.replace('flex','hidden');b.onclick=()=>{hide();ok()};document.getElementById('cmNo').onclick=hide;cm.onclick=e=>{if(e.target===cm)hide()}}
+document.addEventListener('submit',e=>{const f=e.target;if(f.dataset.confirm&&!f.dataset.ok){e.preventDefault();ask(f.dataset.confirm,()=>{f.dataset.ok=1;f.requestSubmit()},f.dataset.okText)}},true);
+document.addEventListener('click',e=>{const a=e.target.closest('a[data-confirm]');if(a){e.preventDefault();ask(a.dataset.confirm,()=>location.href=a.href,a.dataset.okText)}});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')cm.classList.replace('flex','hidden')});
+</script></body></html>
