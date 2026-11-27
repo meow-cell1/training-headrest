@@ -20,6 +20,7 @@ PORT = int(os.environ.get("PORT", 5000))
 TZ_OFFSET = 7                                                     # zona waktu: 7 = WIB, 8 = WITA, 9 = WIT
 REQUIRE_SCHEDULE = True                                           # True = peserta hanya bisa masuk saat jadwalnya aktif
 CHECK_ORIGIN = True                                               # tolak POST dari website lain (keamanan)
+TRASH_DAYS = 31                                                   # lama riwayat terhapus disimpan di Sampah (hari)
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"       # set 1 jika diakses lewat HTTPS
 LEVELS = {"mudah": ("Mudah", 10), "normal": ("Normal", 6), "sulit": ("Sulit", 4)}   # detik per soal
 # =======================================
@@ -88,6 +89,9 @@ add_cols("questions", [("div_id", "INTEGER"), ("explain_img", "TEXT")])      # N
 add_cols("materials", [("div_id", "INTEGER")])
 add_cols("people", [("div_id", "INTEGER")])          # divisi asal peserta (untuk pengelompokan di admin)
 q("CREATE TABLE IF NOT EXISTS resets(id INTEGER PRIMARY KEY AUTOINCREMENT, nik TEXT, div_id INTEGER, at TEXT)")
+q("""CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, data TEXT, deleted_at TEXT,
+     expires TEXT, batch TEXT, reason TEXT)""")
+add_cols("schedules", [("created", "TEXT")])          # kapan jadwal diinput admin (dipakai untuk putaran baru)
 add_cols("events", [("div_id", "INTEGER")])
 EVENT = {"pre": "Pre Test", "buka": "Membuka materi", "baca": "Lama membaca materi", "post": "Post Test",
          "remed": "Post Remedial"}
@@ -122,6 +126,48 @@ def now_min():
 def log(kind, detail="", secs=None):
     q("INSERT INTO events(name,nik,kind,detail,secs,at,div_id) VALUES(?,?,?,?,?,?,?)",
       (session.get("name"), session.get("nik"), kind, detail, secs, now(), session.get("div")))
+
+
+_purge = {"t": 0}
+
+
+def purge_trash():
+    # Hapus permanen isi Sampah yang sudah lewat TRASH_DAYS hari
+    q("DELETE FROM trash WHERE expires < ?", (now(),))
+    _purge["t"] = time.time()
+
+
+@app.before_request
+def auto_purge():
+    if time.time() - _purge["t"] > 1800 and request.path.startswith("/admin"):
+        purge_trash()
+
+
+def to_trash(kind, rows, reason):
+    # Simpan baris yang dihapus admin ke Sampah; hilang otomatis setelah TRASH_DAYS hari
+    if not rows:
+        return 0
+    at = now_dt()
+    exp = (at + timedelta(days=TRASH_DAYS)).strftime(DTF)
+    batch = uuid.uuid4().hex[:10]
+    con = sqlite3.connect(DB)
+    try:
+        con.executemany("INSERT INTO trash(kind,data,deleted_at,expires,batch,reason) VALUES(?,?,?,?,?,?)",
+                        [(kind, json.dumps(dict(r), ensure_ascii=False), at.strftime(DTF), exp, batch, reason) for r in rows])
+        con.commit()
+    finally:
+        con.close()
+    return len(rows)
+
+
+def restore_item(t):
+    d = json.loads(t["data"])
+    table = "attempts" if t["kind"] == "attempt" else "events"
+    cols = {r["name"] for r in q(f"PRAGMA table_info({table})")}
+    d = {k: v for k, v in d.items() if k in cols}
+    if d:
+        q(f"INSERT OR IGNORE INTO {table}({','.join(d)}) VALUES({','.join('?' * len(d))})", list(d.values()))
+    q("DELETE FROM trash WHERE id=?", (t["id"],))
 
 
 @app.template_filter("dur")
@@ -480,13 +526,34 @@ def mat_open_since(did, ref):
                   (session.get("nik"), did, ref), True))
 
 
+def new_round(pid, did, done_at):
+    # Putaran baru terbuka jika ada jadwal aktif (untuk divisi ini) yang MULAI atau DIINPUT admin setelah peserta selesai
+    if not REQUIRE_SCHEDULE:
+        return False
+    n = now_min()
+    return any(w["t_start"] <= n <= w["t_end"] and (w["div_id"] is None or w["div_id"] == did)
+               and (w["t_start"] > done_at or (w["created"] or "") > done_at) for w in person_windows(pid))
+
+
+def div_state(pid, nik, name, did):
+    pre, post, rem = get_cycle(nik, name, did)
+    if post and not need_remed(pre, post, rem):
+        done_at = (rem[-1] if rem else post)["created"]
+        return "baru" if new_round(pid, did, done_at) else "selesai"
+    return "jalan" if (pre or post) else "belum"
+
+
 def flow():
     """Status tahap peserta pada divisi yang dipilih (dibaca dari database)."""
     did, nik, name = session.get("div"), session.get("nik"), session.get("name")
     pre, post, rem = get_cycle(nik, name, did)
+    t0 = session.get("t0", "")
+    if post and not need_remed(pre, post, rem):                  # siklus sebelumnya sudah selesai
+        done_at = (rem[-1] if rem else post)["created"]
+        if new_round(session.get("pid"), did, done_at):          # jadwal baru sudah ada -> mulai putaran baru
+            pre, post, rem, t0 = None, None, [], max(t0, done_at)
     c = {p: len(bank(p, did)) for p in PHASE}
     nm = q("SELECT COUNT(*) c FROM materials WHERE div_id IS NULL OR div_id=?", (did,), True)["c"]
-    t0 = session.get("t0", "")
     pre_ok = pre is not None or c["pre"] == 0
     mat_open = mat_open_since(did, pre["created"] if pre else t0)
     mat_ok = nm == 0 or mat_open
@@ -576,7 +643,8 @@ def divisi():
             why = "Di luar jadwalmu"
         else:
             why = ""
-        items.append(dict(id=d["id"], name=d["name"], open=not why, why=why))
+        items.append(dict(id=d["id"], name=d["name"], open=not why, why=why,
+                          state=div_state(pid, session.get("nik"), session.get("name"), d["id"])))
     ws = [dict(t_start=w["t_start"], t_end=w["t_end"], dname=w["dname"] or "Semua divisi", st=win_status(w))
           for w in person_windows(pid)]
     return render_template("divisi.html", items=items, ws=ws)
@@ -799,8 +867,8 @@ def valid_date(v):
         return ""
 
 
-def get_filters():
-    a = request.args
+def get_filters(src=None):
+    a = src if src is not None else request.args
     return {"ph": a.get("phase", ""), "s": a.get("q", "").strip(), "dv": a.get("div", ""),
             "df": valid_date(a.get("from", "")), "dt": valid_date(a.get("to", ""))}
 
@@ -846,6 +914,14 @@ def timeline_data(f):
     return sorted(ppl.values(), key=lambda d: d["name"].lower())
 
 
+PAGE = 25
+
+
+def back_to():
+    n = request.form.get("next", "")
+    return redirect(n if n.startswith("/admin") and not n.startswith("//") else url_for("dashboard"))
+
+
 @app.get("/admin")
 @admin_only
 def dashboard():
@@ -874,10 +950,54 @@ def dashboard():
         if y:
             p["to"] = y
         presets.append({"label": lab, "href": "/admin?" + urlencode(p), "on": (f["df"], f["dt"]) == (x, y)})
-    qs = urlencode({k: v for k, v in (("div", f["dv"]), ("phase", f["ph"]), ("q", f["s"]), ("from", f["df"]), ("to", f["dt"])) if v})
-    return render_template("admin_dash.html", rows=rows, f=f, st=st, people=people, total=total, PASS=PASS_SCORE,
-                           prog=prog, cnt=cnt, donut=donut, chart=chart, tl=timeline_data(f), presets=presets, qs=qs,
+    pq = {k: v for k, v in (("div", f["dv"]), ("phase", f["ph"]), ("q", f["s"]), ("from", f["df"]), ("to", f["dt"])) if v}
+    # halaman tabel riwayat
+    n_rows = len(rows)
+    pages = max(1, -(-n_rows // PAGE))
+    pg = request.args.get("page", "1")
+    pg = min(int(pg) if pg.isdigit() and int(pg) > 0 else 1, pages)
+
+    def plink(n):
+        return "/admin?" + urlencode({**pq, "page": n}) + "#riwayat"
+    pager = {"page": pg, "pages": pages, "total": n_rows, "first": (pg - 1) * PAGE + 1 if n_rows else 0,
+             "last": min(pg * PAGE, n_rows), "prev": plink(pg - 1) if pg > 1 else None,
+             "next": plink(pg + 1) if pg < pages else None,
+             "nums": [(n, plink(n)) for n in range(max(1, pg - 2), min(pages, pg + 2) + 1)]}
+    return render_template("admin_dash.html", rows=rows[(pg - 1) * PAGE: pg * PAGE], pager=pager, f=f, st=st, people=people,
+                           total=total, PASS=PASS_SCORE, prog=prog, cnt=cnt, donut=donut, chart=chart,
+                           tl=timeline_data(f), presets=presets, qs=urlencode(pq), filtered=bool(pq),
+                           all_count=q("SELECT COUNT(*) c FROM attempts", (), True)["c"],
+                           trash_count=q("SELECT COUNT(*) c FROM trash", (), True)["c"],
+                           nxt=request.full_path.rstrip("?") + "#riwayat",
                            divs=q("SELECT * FROM divisions ORDER BY name COLLATE NOCASE"))
+
+
+@app.post("/admin/riwayat/hapus/<int:aid>")
+@admin_only
+def attempt_del(aid):
+    r = q("SELECT * FROM attempts WHERE id=?", (aid,), True)
+    if r:
+        to_trash("attempt", [r], "Hapus satu tes")
+        q("DELETE FROM attempts WHERE id=?", (aid,))
+        flash(f"Riwayat tes dipindahkan ke Sampah (tersimpan {TRASH_DAYS} hari, bisa dipulihkan).")
+    return back_to()
+
+
+@app.post("/admin/riwayat/hapus-semua")
+@admin_only
+def attempts_del_all():
+    if request.form.get("mode") == "all":
+        if request.form.get("ok") != "HAPUS":
+            flash("Dibatalkan: konfirmasi tidak sesuai.")
+            return back_to()
+        rows, reason, cond, a = q("SELECT * FROM attempts"), "Hapus semua riwayat", "", []
+    else:
+        cond, a = where(get_filters(request.form))
+        rows, reason = q("SELECT * FROM attempts WHERE 1=1" + cond, a), "Hapus hasil filter"
+    n = to_trash("attempt", rows, reason)
+    q("DELETE FROM attempts WHERE 1=1" + cond, a)
+    flash(f"{n} riwayat tes dipindahkan ke Sampah (tersimpan {TRASH_DAYS} hari, bisa dipulihkan).")
+    return back_to()
 
 
 @app.get("/admin/backup.db")
@@ -1040,8 +1160,8 @@ def admin_sched():
             return redirect(url_for("admin_sched"))
         did = div_or_none(f.get("div"))
         for p in pids:
-            q("INSERT INTO schedules(pid,div_id,t_start,t_end) VALUES(?,?,?,?)",
-              (p, did, s.strftime(DTMIN), e.strftime(DTMIN)))
+            q("INSERT INTO schedules(pid,div_id,t_start,t_end,created) VALUES(?,?,?,?,?)",
+              (p, did, s.strftime(DTMIN), e.strftime(DTMIN), now()))
         flash(f"Jadwal ditambahkan untuk {len(pids)} peserta.")
         return redirect(url_for("admin_sched"))
     s = request.args.get("q", "").strip()
@@ -1052,7 +1172,8 @@ def admin_sched():
         a += [f"%{s}%"] * 2
     rows = [dict(r, st=win_status(r)) for r in q(sql + " ORDER BY s.t_start DESC LIMIT 500", a)]
     d0 = now_dt().replace(minute=0, second=0) + timedelta(hours=1)
-    return render_template("admin_sched.html", rows=rows, s=s, people=q("SELECT p.*, d.name dname FROM people p LEFT JOIN divisions d ON d.id=p.div_id ORDER BY p.name COLLATE NOCASE"),
+    return render_template("admin_sched.html", rows=rows, s=s,
+                           nosched=q("SELECT COUNT(*) c FROM people p WHERE NOT EXISTS (SELECT 1 FROM schedules s WHERE s.pid=p.id AND s.t_end>=?)", (now_min(),), True)["c"], people=q("SELECT p.*, d.name dname FROM people p LEFT JOIN divisions d ON d.id=p.div_id ORDER BY p.name COLLATE NOCASE"),
                            divs=q("SELECT * FROM divisions ORDER BY name COLLATE NOCASE"),
                            ds=d0.strftime("%Y-%m-%dT%H:%M"), de=(d0 + timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M"))
 
@@ -1365,6 +1486,91 @@ def people_del(pid):
     return redirect(url_for("admin_people"))
 
 
+@app.post("/admin/aktivitas/hapus-semua")
+@admin_only
+def events_del_all():
+    s, k = request.form.get("q", "").strip(), request.form.get("kind", "")
+    sql, a = "FROM events WHERE 1=1", []
+    if s:
+        sql += " AND (name LIKE ? OR nik LIKE ?)"
+        a += [f"%{s}%"] * 2
+    if k in EVENT:
+        sql += " AND kind=?"
+        a.append(k)
+    n = to_trash("event", q("SELECT * " + sql, a), "Hapus log aktivitas")
+    q("DELETE " + sql, a)
+    flash(f"{n} log aktivitas dipindahkan ke Sampah (tersimpan {TRASH_DAYS} hari, bisa dipulihkan).")
+    return redirect(url_for("activity"))
+
+
+@app.get("/admin/sampah")
+@admin_only
+def trash_page():
+    purge_trash()
+    k, s = request.args.get("kind", ""), request.args.get("q", "").strip()
+    dm = {d["id"]: d["name"] for d in q("SELECT id,name FROM divisions")}
+    sql, a = "SELECT * FROM trash WHERE 1=1", []
+    if k in ("attempt", "event"):
+        sql += " AND kind=?"
+        a.append(k)
+    n, items = now_dt(), []
+    for t in q(sql + " ORDER BY id DESC LIMIT 1000", a):
+        d = json.loads(t["data"])
+        if t["kind"] == "attempt":
+            summ = f"{d.get('name')} · {dm.get(d.get('div_id'), '-')} · {PHASE.get(d.get('phase'), '?')} · skor {d.get('score')}%"
+            when = d.get("created")
+        else:
+            summ = f"{d.get('name')} · {EVENT.get(d.get('kind'), d.get('kind'))} · {d.get('detail') or ''}"
+            when = d.get("at")
+        if s and s.lower() not in summ.lower():
+            continue
+        left = max(0, -(-int((datetime.strptime(t["expires"], DTF) - n).total_seconds()) // 86400))
+        items.append({"id": t["id"], "kind": t["kind"], "summ": summ, "when": when, "deleted": t["deleted_at"][:16],
+                      "reason": t["reason"], "left": left})
+    batches = q("SELECT batch, reason, kind, MAX(deleted_at) at, COUNT(*) c FROM trash GROUP BY batch ORDER BY MAX(id) DESC LIMIT 15")
+    return render_template("admin_trash.html", items=items[:300], more=max(0, len(items) - 300), batches=batches, k=k, s=s,
+                           days=TRASH_DAYS, total=q("SELECT COUNT(*) c FROM trash", (), True)["c"])
+
+
+@app.post("/admin/sampah/pulihkan/<int:tid>")
+@admin_only
+def trash_restore(tid):
+    t = q("SELECT * FROM trash WHERE id=?", (tid,), True)
+    if t:
+        restore_item(t)
+        flash("Data dipulihkan ke tempat semula.")
+    return redirect(url_for("trash_page"))
+
+
+@app.post("/admin/sampah/pulihkan-batch/<batch>")
+@admin_only
+def trash_restore_batch(batch):
+    rows = q("SELECT * FROM trash WHERE batch=? ORDER BY id", (batch,))
+    for t in rows:
+        restore_item(t)
+    flash(f"{len(rows)} data dipulihkan.")
+    return redirect(url_for("trash_page"))
+
+
+@app.post("/admin/sampah/hapus/<int:tid>")
+@admin_only
+def trash_delete(tid):
+    q("DELETE FROM trash WHERE id=?", (tid,))
+    flash("Data dihapus permanen.")
+    return redirect(url_for("trash_page"))
+
+
+@app.post("/admin/sampah/kosongkan")
+@admin_only
+def trash_empty():
+    if request.form.get("ok") == "HAPUS":
+        q("DELETE FROM trash")
+        flash("Sampah dikosongkan. Data dihapus permanen.")
+    else:
+        flash("Dibatalkan: konfirmasi tidak sesuai.")
+    return redirect(url_for("trash_page"))
+
+
 @app.get("/admin/aktivitas")
 @admin_only
 def activity():
@@ -1393,6 +1599,7 @@ TEMPLATES["base.html"] = r'''<!doctype html>
   <link rel="icon" href="{{ logo_url or 'data:,' }}">
   <style>
     .hidden{display:none}
+    @media (max-width:640px){input,select,textarea{font-size:16px!important}}
     .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
     #twwarn{display:none;margin:0;padding:10px 16px;background:#fef3c7;color:#92400e;font:14px system-ui,sans-serif;text-align:center}
     .blob{position:fixed;z-index:-1;border-radius:9999px;filter:blur(80px);opacity:.5;pointer-events:none;animation:floaty 16s ease-in-out infinite}
@@ -1412,6 +1619,7 @@ TEMPLATES["base.html"] = r'''<!doctype html>
     .donut{animation:spinin 1.1s cubic-bezier(.2,.8,.2,1) backwards .2s}
     @keyframes fall{0%{transform:translateY(-10vh) rotate(0);opacity:1}100%{transform:translateY(105vh) rotate(720deg);opacity:.9}}
     .confetti{position:fixed;top:0;z-index:60;width:9px;height:14px;border-radius:2px;pointer-events:none;animation:fall linear forwards}
+    .text-logo{color:#d6001a}
     .text-grad{background:linear-gradient(90deg,#7c3aed,#d946ef,#ec4899);-webkit-background-clip:text;background-clip:text;color:transparent}
     @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
   </style>
@@ -1447,22 +1655,23 @@ TEMPLATES["base.html"] = r'''<!doctype html>
 <script>window.addEventListener('load',function(){if(typeof window.tailwind==='undefined')document.getElementById('twwarn').style.display='block';});</script>
 
 {% set is_admin_area = session.get('admin') and request.path.startswith('/admin') %}
+{% set nav = [('/admin','Dashboard','📊'),('/admin/divisi','Divisi','🏭'),('/admin/peserta','Peserta','👥'),('/admin/jadwal','Jadwal','📅'),('/admin/soal/pre','Soal Pre','📝'),('/admin/soal/post','Soal Post','✅'),('/admin/soal/remed','Soal Remedial','🔁'),('/admin/materi','Materi','📚'),('/admin/aktivitas','Aktivitas','🕒'),('/admin/sampah','Sampah','🗑️')] %}
 <header class="sticky top-0 z-30 border-b border-white/60 bg-white/70 backdrop-blur-xl">
   <div class="h-0.5 bg-gradient-to-r from-brand-500 via-fuchsia-500 to-pink-500"></div>
-  <div class="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3">
+  <div class="mx-auto flex {{ 'max-w-[1560px]' if is_admin_area else 'max-w-6xl' }} items-center justify-between gap-4 px-4 py-3">
     <a href="/" class="group flex items-center gap-3">
       {% if logo_url %}<img src="{{ logo_url }}" alt="Logo" class="h-10 w-10 object-contain">
       {% else %}<span class="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-brand-600 to-pink-500 text-white shadow-lg shadow-brand-500/30 transition group-hover:rotate-6 group-hover:scale-105">
         <svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/></svg>
       </span>{% endif %}
       <span class="leading-tight"><span class="block text-[10px] font-bold uppercase tracking-[.25em] text-brand-500">Training</span>
-      <span class="block text-sm font-extrabold">Quality</span></span>
+      <span class="block text-sm font-extrabold text-grad">Quality</span></span>
     </a>
     <div class="flex items-center gap-3 text-sm">
       {% if session.get('name') and not is_admin_area %}
         <span class="hidden text-slate-500 sm:block">{{ session.name }}{% if session.get('div') %} · {{ divmap.get(session.div, '') }}{% endif %}</span>
-        {% if session.get('div') and not all_done %}<a href="/divisi/ganti" class="btn btn-ghost !py-1.5">Ganti divisi</a>{% endif %}
-        <a href="/selesai" class="btn btn-ghost !py-1.5">Keluar</a>
+        {% if session.get('div') and not all_done %}<a href="/divisi/ganti" class="btn btn-ghost !px-3 !py-1.5 !text-xs sm:!px-4 sm:!text-sm">Ganti divisi</a>{% endif %}
+        <a href="/selesai" class="btn btn-ghost !px-3 !py-1.5 !text-xs sm:!px-4 sm:!text-sm">Keluar</a>
       {% endif %}
       {% if session.get('admin') %}
         <a href="/admin" class="btn btn-ghost !py-1.5">Admin</a>
@@ -1472,17 +1681,34 @@ TEMPLATES["base.html"] = r'''<!doctype html>
     </div>
   </div>
   {% if is_admin_area %}
-  {% set nav = [('/admin','Dashboard'),('/admin/divisi','Divisi'),('/admin/jadwal','Jadwal'),('/admin/soal/pre','Soal Pre'),('/admin/soal/post','Soal Post'),('/admin/soal/remed','Soal Remedial'),('/admin/materi','Materi'),('/admin/peserta','Peserta'),('/admin/aktivitas','Aktivitas')] %}
-  <nav class="mx-auto flex max-w-6xl gap-1 overflow-x-auto px-4 pb-2">
-    {% for href, t in nav %}
-      <a href="{{ href }}" class="whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium transition {{ 'bg-gradient-to-r from-brand-600 to-pink-500 text-white shadow shadow-brand-500/30' if request.path == href else 'text-slate-500 hover:bg-brand-50 hover:text-brand-700' }}">{{ t }}</a>
+  <nav class="flex gap-1 overflow-x-auto px-4 pb-2 lg:hidden">
+    {% for href, t, ic in nav %}
+      {% set on = request.path == href or (href != '/admin' and request.path.startswith(href)) %}
+      <a href="{{ href }}" class="whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium transition {{ 'bg-gradient-to-r from-brand-600 to-pink-500 text-white shadow shadow-brand-500/30' if on else 'text-slate-500 hover:bg-brand-50 hover:text-brand-700' }}">{{ ic }} {{ t }}</a>
     {% endfor %}
     <a href="/admin/logout" class="ml-auto whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium text-rose-600 transition hover:bg-rose-50">Logout</a>
   </nav>
   {% endif %}
 </header>
 
-<main class="mx-auto px-4 py-8 {% block width %}max-w-3xl{% endblock %}">
+<div class="{% if is_admin_area %}mx-auto flex max-w-[1560px] items-start gap-6 px-4 py-6{% endif %}">
+{% if is_admin_area %}
+<aside class="sticky top-24 hidden w-60 shrink-0 lg:block">
+  <nav class="card space-y-1 p-3">
+    <p class="px-3 pb-1 pt-2 text-[10px] font-bold uppercase tracking-[.2em] text-slate-400">Menu admin</p>
+    {% for href, t, ic in nav %}
+      {% set on = request.path == href or (href != '/admin' and request.path.startswith(href)) %}
+      <a href="{{ href }}" class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition {{ 'bg-gradient-to-r from-brand-600 to-pink-500 text-white shadow-md shadow-brand-500/30' if on else 'text-slate-600 hover:bg-brand-50 hover:text-brand-700' }}">
+        <span class="grid h-7 w-7 place-items-center rounded-lg text-base {{ 'bg-white/25' if on else 'bg-brand-50' }}">{{ ic }}</span>{{ t }}
+      </a>
+    {% endfor %}
+    <div class="my-2 border-t border-brand-100"></div>
+    <a href="/admin/logout" class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-rose-600 transition hover:bg-rose-50">
+      <span class="grid h-7 w-7 place-items-center rounded-lg bg-rose-50 text-base">↩</span>Logout</a>
+  </nav>
+</aside>
+{% endif %}
+<main class="{% if is_admin_area %}min-w-0 flex-1{% else %}mx-auto w-full px-4 py-8 {% block width %}max-w-3xl{% endblock %}{% endif %}">
   {% with msgs = get_flashed_messages() %}
     {% for m in msgs %}
       <div class="fade-up mb-4 flex items-start gap-3 rounded-xl border border-brand-200 bg-gradient-to-r from-brand-50 to-pink-50 px-4 py-3 text-sm text-brand-800">
@@ -1491,8 +1717,11 @@ TEMPLATES["base.html"] = r'''<!doctype html>
       </div>
     {% endfor %}
   {% endwith %}
+  <div class="{% if is_admin_area %}{% block awidth %}max-w-6xl{% endblock %}{% endif %}">
   {% block content %}{% endblock %}
+  </div>
 </main>
+</div>
 
 <footer class="pb-8 text-center text-xs text-slate-400">Training Quality</footer>
 
@@ -1530,7 +1759,7 @@ TEMPLATES["home.html"] = r'''{% extends "base.html" %}
       </div>
       {% endif %}
       <p class="text-[11px] font-bold uppercase tracking-[.35em] text-brand-500">Pelatihan Operator</p>
-      <h1 class="mt-2 text-3xl font-extrabold leading-tight tracking-tight sm:text-4xl"><span class="text-grad">Training Quality</span></h1>
+      <h1 class="mt-2 text-3xl font-extrabold leading-tight tracking-tight sm:text-4xl"><span class="text-logo">Training Quality</span></h1>
       <p class="mt-3 text-slate-500">Pilih nama dan masukkan NIK untuk memulai.</p>
     </div>
     <form method="post" class="card fade-up space-y-4 p-6" style="--d:.15s">
@@ -1618,7 +1847,10 @@ TEMPLATES["divisi.html"] = r'''{% extends "base.html" %}
       <div class="grid h-12 w-12 shrink-0 place-items-center rounded-xl text-lg font-bold text-white {{ 'bg-gradient-to-br from-brand-600 to-pink-500' if d.open else 'bg-slate-200 !text-slate-400' }}">{{ d.name[:1]|upper }}</div>
       <div class="min-w-0 flex-1">
         <h2 class="truncate text-lg font-bold">{{ d.name }}</h2>
-        <p class="text-sm {{ 'text-emerald-600' if d.open else 'text-amber-600' }}">{{ 'Tersedia, klik untuk mulai' if d.open else '🔒 ' ~ d.why }}</p>
+        <p class="text-sm {{ 'text-emerald-600' if d.open else 'text-amber-600' }}">{{ ('Lihat hasil training' if d.state == 'selesai' else 'Tersedia, klik untuk mulai') if d.open else '🔒 ' ~ d.why }}</p>
+        {% if d.state == 'selesai' %}<span class="pill mt-1 bg-emerald-100 text-emerald-700">✓ Sudah selesai</span>
+        {% elif d.state == 'baru' %}<span class="pill mt-1 bg-sky-100 text-sky-700">Jadwal baru tersedia</span>
+        {% elif d.state == 'jalan' %}<span class="pill mt-1 bg-amber-100 text-amber-700">Sedang berjalan</span>{% endif %}
       </div>
       {% if d.open %}<span class="grid h-9 w-9 place-items-center rounded-full bg-brand-50 text-brand-600 transition group-hover:translate-x-1 group-hover:bg-brand-600 group-hover:text-white">→</span>{% endif %}
     </{{ tag }}>
@@ -1735,14 +1967,14 @@ TEMPLATES["quiz.html"] = r'''{% extends "base.html" %}
       </div>
       {% endfor %}
     </div>
-    <p class="mt-4 text-xs text-slate-400">Tips: tekan angka 1 sampai 4 di keyboard untuk menjawab.</p>
+    <p class="mt-4 hidden text-xs text-slate-400 sm:block">Tips: tekan angka 1 sampai 4 di keyboard untuk menjawab.</p>
     <button id="go" type="button" class="btn btn-primary mt-5 w-full !py-3.5">Mulai {{ title }}</button>
   </div>
   {% endif %}
 </div>
 
-<div id="ov" style="display:none;position:fixed;inset:0;z-index:50;align-items:center;justify-content:center;padding:1rem;background:rgba(46,16,101,.55);backdrop-filter:blur(6px)">
-  <div id="card" class="w-full max-w-xl overflow-hidden rounded-3xl bg-white shadow-2xl">
+<div id="ov" style="display:none;position:fixed;inset:0;z-index:50;padding:1rem;overflow-y:auto;background:rgba(46,16,101,.55);backdrop-filter:blur(6px)">
+  <div id="card" class="m-auto w-full max-w-xl overflow-hidden rounded-3xl bg-white shadow-2xl">
     <div class="h-1.5 bg-slate-100"><div id="tb" class="h-full bg-gradient-to-r from-brand-500 to-pink-500" style="width:100%"></div></div>
     <div class="p-6 sm:p-8">
       <div class="flex items-center justify-between text-xs">
@@ -1755,7 +1987,7 @@ TEMPLATES["quiz.html"] = r'''{% extends "base.html" %}
       <div id="op" class="grid gap-2.5 sm:grid-cols-2"></div>
     </div>
   </div>
-  <div id="sending" style="display:none" class="w-full max-w-sm rounded-3xl bg-white p-10 text-center shadow-2xl">
+  <div id="sending" style="display:none" class="m-auto w-full max-w-sm rounded-3xl bg-white p-10 text-center shadow-2xl">
     <div class="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-brand-100 border-t-brand-600"></div>
     <p class="mt-4 font-semibold">Menyimpan hasil...</p>
     <button id="retry" type="button" style="display:none" class="btn btn-primary mt-4">Coba kirim lagi</button>
@@ -2056,26 +2288,37 @@ TEMPLATES["login.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_dash.html"] = r'''{% extends "base.html" %}
 {% block title %}Dashboard{% endblock %}
-{% block width %}max-w-6xl{% endblock %}
+{% block awidth %}max-w-7xl{% endblock %}
 {% block content %}
-{% set pre = st.get('pre') %}{% set post = st.get('post') %}{% set rm = st.get('remed') %}
-<div class="grid grid-cols-2 gap-3 lg:grid-cols-5">
-  {% set cards = [
-    ('Total percobaan', total, '', 'from-brand-500 to-fuchsia-500'),
-    ('Peserta', people, '', 'from-fuchsia-500 to-pink-500'),
-    ('Rata-rata Pre', (pre.m|int) if pre else none, '%', 'from-sky-400 to-brand-500'),
-    ('Rata-rata Post', (post.m|int) if post else none, '%', 'from-pink-500 to-rose-400'),
-    ('Rata-rata Remedial', (rm.m|int) if rm else none, '%', 'from-emerald-400 to-teal-500')] %}
-  {% for t, v, suf, g in cards %}
-  <div class="card fade-up relative overflow-hidden p-5" style="--d:{{ loop.index0 * 0.08 }}s">
-    <div class="absolute -right-6 -top-6 h-24 w-24 rounded-full bg-gradient-to-br {{ g }} opacity-25"></div>
-    <p class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{ t }}</p>
-    <p class="mt-1 text-3xl font-extrabold">{% if v is none %}-{% else %}<span data-count="{{ v }}">{{ v }}</span>{{ suf }}{% endif %}</p>
-  </div>
-  {% endfor %}
+{% macro sect(title, id, hint='') %}
+<div id="{{ id }}" class="mb-3 mt-10 flex scroll-mt-28 items-center gap-3">
+  <h2 class="whitespace-nowrap text-sm font-bold uppercase tracking-[.18em] text-slate-500">{{ title }}</h2>
+  <span class="h-px flex-1 bg-brand-100"></span>
+  {% if hint %}<span class="hidden text-xs text-slate-400 sm:block">{{ hint }}</span>{% endif %}
 </div>
+{% endmacro %}
+{% set pre = st.get('pre') %}{% set post = st.get('post') %}{% set rm = st.get('remed') %}
 
-<form method="get" class="card fade-up mt-6 space-y-3 p-5">
+<div class="flex flex-wrap items-end justify-between gap-3">
+  <div>
+    <h1 class="text-2xl font-extrabold tracking-tight">Dashboard</h1>
+    <p class="mt-0.5 text-sm text-slate-500">
+      {% if f.df or f.dt %}{{ f.df or '…' }} s/d {{ f.dt or '…' }}{% else %}Semua waktu{% endif %}
+      · {{ divmap.get(f.dv|int, 'Semua divisi') if f.dv else 'Semua divisi' }}
+    </p>
+  </div>
+  <div class="flex flex-wrap gap-2">
+    <a href="/admin/backup.db" class="btn btn-ghost">Backup database</a>
+    <a href="/admin/riwayat.xlsx?{{ qs }}" class="btn btn-primary">Unduh Excel</a>
+  </div>
+</div>
+<nav class="mt-4 flex flex-wrap gap-2 text-xs font-semibold">
+  {% for href, t in [('#ringkasan','Ringkasan'),('#progres','Grafik progres'),('#tren','Tren peserta'),('#daftar','Daftar progres'),('#riwayat','Riwayat tes')] %}
+  <a href="{{ href }}" class="rounded-full bg-white px-3 py-1.5 text-brand-700 ring-1 ring-brand-100 transition hover:bg-brand-50">{{ t }}</a>
+  {% endfor %}
+</nav>
+
+<form method="get" class="card fade-up mt-5 space-y-3 p-5">
   <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
     <div class="lg:col-span-2"><label class="label">Divisi</label>
       <select name="div" class="input"><option value="">Semua divisi</option>
@@ -2093,16 +2336,34 @@ TEMPLATES["admin_dash.html"] = r'''{% extends "base.html" %}
     <span class="ml-2 text-xs text-slate-400">Cepat:</span>
     {% for p in presets %}<a href="{{ p.href }}" class="pill {{ 'bg-gradient-to-r from-brand-600 to-pink-500 text-white' if p.on else 'bg-brand-50 text-brand-700 hover:bg-brand-100' }}">{{ p.label }}</a>{% endfor %}
   </div>
-  <p class="text-xs text-slate-400">Filter berlaku untuk kartu, grafik, daftar progres, tabel riwayat, dan file Excel.{% if f.df or f.dt %} Rentang aktif: <b>{{ f.df or '…' }}</b> s/d <b>{{ f.dt or '…' }}</b>.{% endif %}</p>
+  <p class="text-xs text-slate-400">Filter berlaku untuk kartu, grafik, daftar progres, tabel riwayat, dan file Excel.</p>
 </form>
 
 <p id="chartwarn" style="display:none" class="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Grafik gagal dimuat (Chart.js tidak terbaca). Pastikan ada internet, atau simpan https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js sebagai static/chart.js lalu muat ulang.</p>
 
-<div class="mt-4 grid gap-4 lg:grid-cols-3">
-  <div class="card fade-up p-6" style="--d:.2s">
-    <h2 class="font-bold">Ringkasan progres</h2>
+{{ sect('Ringkasan', 'ringkasan', 'Sesuai filter di atas') }}
+<div class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+  {% set cards = [
+    ('Total percobaan', total, '', 'from-brand-500 to-fuchsia-500'),
+    ('Peserta', people, '', 'from-fuchsia-500 to-pink-500'),
+    ('Rata-rata Pre', (pre.m|int) if pre else none, '%', 'from-sky-400 to-brand-500'),
+    ('Rata-rata Post', (post.m|int) if post else none, '%', 'from-pink-500 to-rose-400'),
+    ('Rata-rata Remedial', (rm.m|int) if rm else none, '%', 'from-emerald-400 to-teal-500')] %}
+  {% for t, v, suf, g in cards %}
+  <div class="card fade-up relative overflow-hidden p-5 {{ 'col-span-2 md:col-span-1' if loop.last else '' }}" style="--d:{{ loop.index0 * 0.06 }}s">
+    <div class="absolute -right-6 -top-6 h-24 w-24 rounded-full bg-gradient-to-br {{ g }} opacity-25"></div>
+    <p class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{ t }}</p>
+    <p class="mt-1 text-3xl font-extrabold">{% if v is none %}-{% else %}<span data-count="{{ v }}">{{ v }}</span>{{ suf }}{% endif %}</p>
+  </div>
+  {% endfor %}
+</div>
+
+{{ sect('Grafik progres', 'progres', 'Pre · Post · Remedial') }}
+<div class="grid gap-4 lg:grid-cols-12">
+  <div class="card fade-up p-6 lg:col-span-4">
+    <h3 class="font-bold">Ringkasan progres</h3>
     <p class="text-xs text-slate-400">Nilai akhir (Post atau Remedial terakhir) dibanding Pre</p>
-    <div class="mt-5 flex items-center gap-6">
+    <div class="mt-5 flex flex-wrap items-center justify-center gap-6 sm:justify-start">
       <div class="donut relative h-36 w-36 shrink-0 rounded-full" style="background: {{ donut }}">
         <div class="absolute inset-4 grid place-items-center rounded-full bg-white text-center">
           <div><p class="text-3xl font-extrabold"><span data-count="{{ cnt.total }}">{{ cnt.total }}</span></p><p class="text-[11px] text-slate-400">peserta</p></div>
@@ -2124,20 +2385,21 @@ TEMPLATES["admin_dash.html"] = r'''{% extends "base.html" %}
     </div>
   </div>
 
-  <div class="card fade-up p-6 lg:col-span-2" style="--d:.3s">
-    <h2 class="font-bold">Progres per peserta</h2>
-    <p class="text-xs text-slate-400">Kolom = nilai Pre, Post, dan Remedial. Garis = selisih nilai akhir dan Pre (sumbu kanan). Titik hijau = naik, merah = turun, kuning = tetap.</p>
+  <div class="card fade-up p-6 lg:col-span-8">
+    <h3 class="font-bold">Progres per peserta</h3>
+    <p class="text-xs text-slate-400">Kolom = nilai Pre, Post, Remedial. Garis = selisih nilai akhir dan Pre (sumbu kanan). Titik hijau naik, merah turun, kuning tetap.</p>
     {% if prog %}
     <div class="mt-4 overflow-x-auto"><div id="wrapA" style="height:360px;position:relative"><canvas id="chA"></canvas></div></div>
     {% else %}<p class="py-16 text-center text-sm text-slate-400">Belum ada data pada filter ini.</p>{% endif %}
   </div>
 </div>
 
-<div class="card fade-up mt-4 p-6" style="--d:.35s">
+{{ sect('Tren peserta', 'tren', 'Dari waktu ke waktu') }}
+<div class="card fade-up p-6">
   <div class="flex flex-wrap items-end justify-between gap-3">
     <div>
-      <h2 class="font-bold">Tren nilai satu peserta</h2>
-      <p class="text-xs text-slate-400">Setiap tes yang dikerjakan pada rentang waktu terpilih, berurutan: Pre, Post, lalu Remedial. Atur rentang di filter di atas.</p>
+      <h3 class="font-bold">Tren nilai satu peserta</h3>
+      <p class="text-xs text-slate-400">Setiap tes pada rentang waktu terpilih: Pre, Post, lalu Remedial. Atur rentang di filter.</p>
     </div>
     <div class="min-w-[240px]"><label class="label">Pilih peserta</label><select id="tlSel" class="input"></select></div>
   </div>
@@ -2146,61 +2408,75 @@ TEMPLATES["admin_dash.html"] = r'''{% extends "base.html" %}
   <p id="tlEmpty" style="display:none" class="py-12 text-center text-sm text-slate-400">Belum ada tes pada filter ini.</p>
 </div>
 
-<details class="card fade-up mt-4 p-4" style="--d:.4s">
+{{ sect('Daftar progres', 'daftar', 'Klik untuk membuka') }}
+<details class="card fade-up p-4">
   <summary class="cursor-pointer font-semibold">Daftar progres per peserta ({{ prog|length }})</summary>
-  <div class="mt-4 max-h-[460px] space-y-2.5 overflow-y-auto pr-1">
+  <div class="mt-4 grid max-h-[520px] gap-2.5 overflow-y-auto pr-1 xl:grid-cols-2">
     {% for r in prog %}
-    <div class="flex flex-col gap-3 rounded-2xl border-l-4 bg-white/70 p-3.5 ring-1 ring-brand-50 sm:flex-row sm:items-center
+    <div class="flex flex-col gap-3 rounded-2xl border-l-4 bg-white/70 p-3.5 ring-1 ring-brand-50
          {{ 'border-emerald-400' if r.status == 'naik' else ('border-rose-400' if r.status == 'turun' else ('border-amber-300' if r.status == 'tetap' else 'border-slate-200')) }}">
-      <div class="w-full shrink-0 sm:w-44">
-        <p class="truncate text-sm font-semibold">{{ r.name }}</p>
-        <p class="text-xs text-slate-400">NIK {{ r.nik }} · {{ r.div }}</p>
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0"><p class="truncate text-sm font-semibold">{{ r.name }}</p><p class="text-xs text-slate-400">NIK {{ r.nik }} · {{ r.div }}</p></div>
+        <div class="shrink-0 text-right">
+          {% if r.status == 'naik' %}<span class="pill bg-emerald-100 text-emerald-700">▲ +{{ r.diff }} naik</span>
+          {% elif r.status == 'turun' %}<span class="pill bg-rose-100 text-rose-700">▼ {{ r.diff }} turun</span>
+          {% elif r.status == 'tetap' %}<span class="pill bg-amber-100 text-amber-700">＝ tetap</span>
+          {% else %}<span class="pill bg-slate-100 text-slate-500">Belum Post</span>{% endif %}
+          {% if r.nrem %}<p class="mt-1 text-[11px] text-slate-400">remedial {{ r.nrem }}×</p>{% endif %}
+        </div>
       </div>
-      <div class="flex-1 space-y-1.5">
-        <div class="flex items-center gap-2"><span class="w-9 text-[11px] text-slate-400">Pre</span>
+      <div class="space-y-1.5">
+        <div class="flex items-center gap-2"><span class="w-10 text-[11px] text-slate-400">Pre</span>
           <div class="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div class="h-full rounded-full bg-brand-300" style="width:{{ r.pre or 0 }}%"></div></div>
           <span class="w-10 text-right text-xs font-semibold text-slate-500">{{ (r.pre ~ '%') if r.pre is not none else '-' }}</span></div>
-        <div class="flex items-center gap-2"><span class="w-9 text-[11px] text-slate-400">Post</span>
+        <div class="flex items-center gap-2"><span class="w-10 text-[11px] text-slate-400">Post</span>
           <div class="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div class="h-full rounded-full bg-gradient-to-r from-brand-600 to-pink-500" style="width:{{ r.post or 0 }}%"></div></div>
           <span class="w-10 text-right text-xs font-semibold">{{ (r.post ~ '%') if r.post is not none else '-' }}</span></div>
         {% if r.remed is not none %}
-        <div class="flex items-center gap-2"><span class="w-9 text-[11px] text-emerald-600">Remed</span>
+        <div class="flex items-center gap-2"><span class="w-10 text-[11px] text-emerald-600">Remed</span>
           <div class="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400" style="width:{{ r.remed }}%"></div></div>
           <span class="w-10 text-right text-xs font-semibold text-emerald-700">{{ r.remed }}%</span></div>
         {% endif %}
       </div>
-      <div class="sm:w-32 sm:text-right">
-        {% if r.status == 'naik' %}<span class="pill bg-emerald-100 text-emerald-700">▲ +{{ r.diff }} naik</span>
-        {% elif r.status == 'turun' %}<span class="pill bg-rose-100 text-rose-700">▼ {{ r.diff }} turun</span>
-        {% elif r.status == 'tetap' %}<span class="pill bg-amber-100 text-amber-700">＝ tetap</span>
-        {% else %}<span class="pill bg-slate-100 text-slate-500">Belum Post</span>{% endif %}
-        {% if r.nrem %}<p class="mt-1 text-[11px] text-slate-400">remedial {{ r.nrem }}×</p>{% endif %}
-        {% if r.rnik %}
-        <form method="post" action="/admin/reset" class="mt-1" onsubmit="return confirm('Reset siklus peserta ini? Peserta bisa mengulang dari Pre Test. Riwayat lama tetap tersimpan.')">
-          <input type="hidden" name="nik" value="{{ r.rnik }}"><input type="hidden" name="div_id" value="{{ r.div_id if r.div_id is not none else '' }}">
-          <button class="text-[11px] text-slate-400 underline hover:text-rose-600">Reset siklus</button></form>
-        {% endif %}
-      </div>
+      {% if r.rnik %}
+      <form method="post" action="/admin/reset" onsubmit="return confirm('Reset siklus peserta ini? Peserta bisa mengulang dari Pre Test. Riwayat lama tetap tersimpan.')">
+        <input type="hidden" name="nik" value="{{ r.rnik }}"><input type="hidden" name="div_id" value="{{ r.div_id if r.div_id is not none else '' }}">
+        <button class="text-[11px] text-slate-400 underline hover:text-rose-600">Reset siklus peserta ini</button></form>
+      {% endif %}
     </div>
     {% else %}
-    <p class="py-10 text-center text-sm text-slate-400">Belum ada data untuk ditampilkan.</p>
+    <p class="py-10 text-center text-sm text-slate-400 xl:col-span-2">Belum ada data untuk ditampilkan.</p>
     {% endfor %}
   </div>
 </details>
 
-<div class="mt-8 flex flex-wrap items-center justify-between gap-3">
-  <h2 class="text-lg font-bold">Riwayat tes <span class="text-sm font-normal text-slate-400">({{ rows|length }})</span></h2>
-  <div class="flex gap-2">
-    <a href="/admin/backup.db" class="btn btn-ghost">Backup database</a>
-    <a href="/admin/riwayat.xlsx?{{ qs }}" class="btn btn-primary">Unduh Excel</a>
+{{ sect('Riwayat tes', 'riwayat', pager.total ~ ' data') }}
+<div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+  <p class="text-sm text-slate-500">Tes yang sudah dikerjakan peserta. Riwayat yang dihapus masuk <a href="/admin/sampah" class="font-semibold text-brand-600 underline">🗑️ Sampah ({{ trash_count }})</a> dan bisa dipulihkan selama 31 hari. Menghapus riwayat juga mengubah progres peserta.</p>
+  <div class="flex flex-wrap gap-2">
+    {% if filtered and pager.total %}
+    <form method="post" action="/admin/riwayat/hapus-semua" onsubmit="return confirm('Hapus {{ pager.total }} riwayat tes hasil filter ini? Tidak bisa dibatalkan.')">
+      <input type="hidden" name="mode" value="filter"><input type="hidden" name="next" value="{{ nxt }}">
+      <input type="hidden" name="div" value="{{ f.dv }}"><input type="hidden" name="phase" value="{{ f.ph }}"><input type="hidden" name="q" value="{{ f.s }}">
+      <input type="hidden" name="from" value="{{ f.df }}"><input type="hidden" name="to" value="{{ f.dt }}">
+      <button class="btn btn-danger !py-2">Hapus hasil filter ({{ pager.total }})</button>
+    </form>
+    {% endif %}
+    {% if all_count %}
+    <form method="post" action="/admin/riwayat/hapus-semua" onsubmit="var v = prompt('Ini menghapus SEMUA {{ all_count }} riwayat tes (semua divisi dan tanggal). Ketik HAPUS untuk melanjutkan:'); if (v !== 'HAPUS') return false; this.ok.value = v; return true;">
+      <input type="hidden" name="mode" value="all"><input type="hidden" name="ok" value=""><input type="hidden" name="next" value="/admin">
+      <button class="btn btn-danger !py-2">Hapus SEMUA riwayat ({{ all_count }})</button>
+    </form>
+    {% endif %}
   </div>
 </div>
 
-<div class="card mt-4 overflow-x-auto">
+<div class="card overflow-hidden">
+  <div class="overflow-x-auto">
   <table class="min-w-full divide-y divide-brand-50">
     <thead class="bg-brand-50/60"><tr>
       <th class="th">Tanggal</th><th class="th">Nama</th><th class="th">Divisi</th><th class="th">Tipe</th><th class="th">Level</th>
-      <th class="th">Skor</th><th class="th">NG lolos</th><th class="th">Status</th><th class="th"></th>
+      <th class="th">Skor</th><th class="th">NG lolos</th><th class="th">Status</th><th class="th text-right">Aksi</th>
     </tr></thead>
     <tbody class="divide-y divide-brand-50">
       {% for r in rows %}
@@ -2209,18 +2485,33 @@ TEMPLATES["admin_dash.html"] = r'''{% extends "base.html" %}
         <td class="td whitespace-nowrap text-slate-500">{{ r['created'] }}</td>
         <td class="td font-medium">{{ r['name'] }}<span class="block text-xs font-normal text-slate-400">{{ r['nik'] }}</span></td>
         <td class="td">{{ divmap.get(r['div_id'], '-') }}</td>
-        <td class="td">{{ PHASE[r['phase']] }}</td>
+        <td class="td whitespace-nowrap">{{ PHASE[r['phase']] }}</td>
         <td class="td">{{ levels[r['level']][0] if r['level'] in levels else '-' }}</td>
         <td class="td font-semibold">{{ r['score'] }}%</td>
         <td class="td {{ 'font-semibold text-rose-600' if (r['esc'] or 0) }}">{{ r['esc'] or 0 }}</td>
         <td class="td"><span class="pill {{ 'bg-emerald-100 text-emerald-700' if ok else 'bg-rose-100 text-rose-700' }}">{{ 'Lulus' if ok else 'Belum' }}</span></td>
-        <td class="td text-right"><a href="/hasil/{{ r['id'] }}" class="font-semibold text-brand-600 hover:underline">Detail</a></td>
+        <td class="td whitespace-nowrap text-right">
+          <a href="/hasil/{{ r['id'] }}" class="font-semibold text-brand-600 hover:underline">Detail</a>
+          <form method="post" action="/admin/riwayat/hapus/{{ r['id'] }}" class="ml-3 inline" onsubmit="return confirm('Hapus riwayat tes ini?')">
+            <input type="hidden" name="next" value="{{ nxt }}"><button class="font-semibold text-rose-600 hover:underline">Hapus</button></form>
+        </td>
       </tr>
       {% else %}
       <tr><td colspan="9" class="p-8 text-center text-slate-400">Belum ada data.</td></tr>
       {% endfor %}
     </tbody>
   </table>
+  </div>
+  {% if pager.total %}
+  <div class="flex flex-wrap items-center justify-between gap-2 border-t border-brand-50 px-4 py-3 text-sm">
+    <span class="text-slate-500">Menampilkan {{ pager.first }}–{{ pager.last }} dari {{ pager.total }}</span>
+    <div class="flex items-center gap-1">
+      {% if pager.prev %}<a href="{{ pager.prev }}" class="btn btn-ghost !py-1.5">←</a>{% endif %}
+      {% for n, href in pager.nums %}<a href="{{ href }}" class="pill !px-3 !py-1.5 {{ 'bg-gradient-to-r from-brand-600 to-pink-500 text-white' if n == pager.page else 'bg-brand-50 text-brand-700 hover:bg-brand-100' }}">{{ n }}</a>{% endfor %}
+      {% if pager.next %}<a href="{{ pager.next }}" class="btn btn-ghost !py-1.5">→</a>{% endif %}
+    </div>
+  </div>
+  {% endif %}
 </div>
 
 <script src="{% if local_chart %}{{ url_for('static', filename='chart.js') }}{% else %}https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js{% endif %}"></script>
@@ -2309,7 +2600,7 @@ TEMPLATES["admin_dash.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_divs.html"] = r'''{% extends "base.html" %}
 {% block title %}Divisi{% endblock %}
-{% block width %}max-w-4xl{% endblock %}
+{% block awidth %}max-w-4xl{% endblock %}
 {% block content %}
 <h1 class="text-2xl font-bold">Divisi Quality <span class="text-base font-normal text-slate-400">({{ rows|length }})</span></h1>
 <p class="mt-1 text-sm text-slate-500">Peserta hanya bisa memilih divisi yang <b>aktif</b> dan sesuai jadwal. Soal & materi tanpa divisi berlaku untuk semua divisi.</p>
@@ -2340,10 +2631,11 @@ TEMPLATES["admin_divs.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_sched.html"] = r'''{% extends "base.html" %}
 {% block title %}Jadwal{% endblock %}
-{% block width %}max-w-5xl{% endblock %}
+{% block awidth %}max-w-5xl{% endblock %}
 {% block content %}
 <h1 class="text-2xl font-bold">Jadwal Training</h1>
-<p class="mt-1 text-sm text-slate-500">Peserta hanya bisa masuk saat jadwalnya aktif. Satu peserta boleh punya beberapa jadwal.</p>
+<p class="mt-1 text-sm text-slate-500">Peserta hanya bisa masuk saat jadwalnya aktif. Satu peserta boleh punya beberapa jadwal. Peserta yang sudah menyelesaikan training bisa mengerjakannya lagi saat ada <b>jadwal baru</b> yang aktif (jadwal yang dimulai atau diinput setelah ia selesai).</p>
+{% if nosched %}<p class="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">⚠️ {{ nosched }} peserta belum punya jadwal aktif atau yang akan datang, sehingga belum bisa masuk.</p>{% endif %}
 
 <form method="post" class="card mt-6 space-y-4 p-5">
   <h2 class="font-semibold">Buat jadwal</h2>
@@ -2418,7 +2710,7 @@ TEMPLATES["admin_sched.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_soal.html"] = r'''{% extends "base.html" %}
 {% block title %}Soal {{ title }}{% endblock %}
-{% block width %}max-w-4xl{% endblock %}
+{% block awidth %}max-w-4xl{% endblock %}
 {% block content %}
 <h1 class="text-2xl font-bold">Soal {{ title }} <span class="text-base font-normal text-slate-400">({{ qs|length }})</span></h1>
 {% if phase == 'remed' %}<p class="mt-1 text-sm text-slate-500">Opsional. Jika divisi belum punya soal Remedial, peserta mengerjakan soal Post Test divisinya.</p>{% endif %}
@@ -2601,7 +2893,7 @@ TEMPLATES["admin_materi.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_people.html"] = r'''{% extends "base.html" %}
 {% block title %}Peserta{% endblock %}
-{% block width %}max-w-5xl{% endblock %}
+{% block awidth %}max-w-5xl{% endblock %}
 {% block content %}
 <h1 class="text-2xl font-bold">Peserta <span class="text-base font-normal text-slate-400">({{ total }})</span></h1>
 <p class="mt-1 text-sm text-slate-500">Peserta dikelompokkan per divisi. Atur waktu training di menu <a href="/admin/jadwal" class="font-semibold text-brand-600 underline">Jadwal</a>.</p>
@@ -2636,29 +2928,25 @@ TEMPLATES["admin_people.html"] = r'''{% extends "base.html" %}
 
 {% for g in groups %}
 <div class="card mt-4 overflow-hidden">
-  <div class="flex items-center justify-between gap-2 bg-brand-50/60 px-4 py-3">
+  <div class="bg-brand-50/60 px-4 py-3">
     <h2 class="font-bold">{{ g.name }} <span class="text-sm font-normal text-slate-400">({{ g.people|length }} peserta)</span></h2>
   </div>
-  <div class="overflow-x-auto">
-  <table class="min-w-full divide-y divide-slate-100">
-    <thead class="bg-slate-50"><tr><th class="th">Nama</th><th class="th">NIK</th><th class="th">Divisi</th><th class="th"></th></tr></thead>
-    <tbody class="divide-y divide-slate-100">
-      {% for p in g.people %}
-      <tr class="hover:bg-slate-50">
-        <td class="td"><input form="pf{{ p.id }}" name="name" value="{{ p.name }}" class="input !py-1.5 font-medium"></td>
-        <td class="td"><input form="pf{{ p.id }}" name="nik" value="{{ p.nik }}" class="input !w-32 !py-1.5"></td>
-        <td class="td"><select form="pf{{ p.id }}" name="div" class="input !py-1.5"><option value="">Tanpa divisi</option>{% for d in divs %}<option value="{{ d.id }}" {{ 'selected' if p.div_id == d.id }}>{{ d.name }}</option>{% endfor %}</select></td>
-        <td class="td whitespace-nowrap text-right">
-          <form id="pf{{ p.id }}" method="post" action="/admin/peserta/edit/{{ p.id }}" class="inline"><input type="hidden" name="flt" value="{{ flt }}"><button class="btn btn-ghost !py-1.5 !text-xs">Simpan</button></form>
-          <form method="post" action="/admin/peserta/hapus/{{ p.id }}" class="inline" onsubmit="return confirm('Hapus peserta ini beserta jadwalnya?')"><button class="btn btn-danger !py-1.5 !text-xs">Hapus</button></form>
-        </td>
-      </tr>
-      {% else %}
-      <tr><td colspan="4" class="p-6 text-center text-sm text-slate-400">Belum ada peserta di divisi ini.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="hidden gap-2 border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-brand-700/70 sm:grid sm:grid-cols-[minmax(0,1.4fr)_8rem_minmax(0,1fr)_11rem]">
+    <span>Nama</span><span>NIK</span><span>Divisi</span><span></span>
   </div>
+  {% for p in g.people %}
+  <div class="grid gap-2 border-t border-slate-100 p-3 first:border-t-0 hover:bg-slate-50 sm:grid-cols-[minmax(0,1.4fr)_8rem_minmax(0,1fr)_11rem] sm:items-center">
+    <div><label class="label sm:hidden">Nama</label><input form="pf{{ p.id }}" name="name" value="{{ p.name }}" class="input !py-1.5 font-medium"></div>
+    <div><label class="label sm:hidden">NIK</label><input form="pf{{ p.id }}" name="nik" value="{{ p.nik }}" class="input !py-1.5"></div>
+    <div><label class="label sm:hidden">Divisi</label><select form="pf{{ p.id }}" name="div" class="input !py-1.5"><option value="">Tanpa divisi</option>{% for d in divs %}<option value="{{ d.id }}" {{ 'selected' if p.div_id == d.id }}>{{ d.name }}</option>{% endfor %}</select></div>
+    <div class="flex gap-2 sm:justify-end">
+      <form id="pf{{ p.id }}" method="post" action="/admin/peserta/edit/{{ p.id }}"><input type="hidden" name="flt" value="{{ flt }}"><button class="btn btn-ghost !py-1.5 !text-xs">Simpan</button></form>
+      <form method="post" action="/admin/peserta/hapus/{{ p.id }}" onsubmit="return confirm('Hapus peserta ini beserta jadwalnya?')"><button class="btn btn-danger !py-1.5 !text-xs">Hapus</button></form>
+    </div>
+  </div>
+  {% else %}
+  <p class="p-6 text-center text-sm text-slate-400">Belum ada peserta di divisi ini.</p>
+  {% endfor %}
 </div>
 {% else %}
 <div class="card mt-4 p-8 text-center text-slate-400">Belum ada divisi atau peserta.</div>
@@ -2668,10 +2956,18 @@ TEMPLATES["admin_people.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_activity.html"] = r'''{% extends "base.html" %}
 {% block title %}Aktivitas{% endblock %}
-{% block width %}max-w-6xl{% endblock %}
+{% block awidth %}max-w-6xl{% endblock %}
 {% block content %}
-<h1 class="text-2xl font-bold">Log Aktivitas</h1>
-<form method="get" class="mt-4 flex flex-wrap gap-2">
+<div class="flex flex-wrap items-end justify-between gap-3">
+  <div><h1 class="text-2xl font-bold">Log Aktivitas</h1><p class="text-sm text-slate-500">Pre/Post, membuka materi, dan lama membaca materi.</p></div>
+  {% if rows %}
+  <form method="post" action="/admin/aktivitas/hapus-semua" onsubmit="return confirm('Hapus SEMUA log aktivitas yang cocok dengan filter{{ ' ini' if s or k else ' (tanpa filter = semua log)' }}? Tidak bisa dibatalkan.')">
+    <input type="hidden" name="q" value="{{ s }}"><input type="hidden" name="kind" value="{{ k }}">
+    <button class="btn btn-danger">Hapus log {{ 'sesuai filter' if s or k else 'semua' }}</button>
+  </form>
+  {% endif %}
+</div>
+<form method="get" class="card mt-4 flex flex-wrap gap-2 p-4">
   <input name="q" value="{{ s }}" placeholder="Cari nama / NIK…" class="input !w-64">
   <select name="kind" class="input !w-auto">
     <option value="">Semua aktivitas</option>
@@ -2706,7 +3002,7 @@ TEMPLATES["admin_activity.html"] = r'''{% extends "base.html" %}
 
 TEMPLATES["admin_soal_edit.html"] = r'''{% extends "base.html" %}
 {% block title %}Edit Soal{% endblock %}
-{% block width %}max-w-4xl{% endblock %}
+{% block awidth %}max-w-4xl{% endblock %}
 {% block content %}
 <a href="/admin/soal/{{ x.phase }}" class="text-sm text-slate-500 transition hover:text-brand-600">← Kembali ke Soal {{ title }}</a>
 <h1 class="mt-2 text-2xl font-bold">Edit soal <span class="text-grad">{{ title }}</span></h1>
@@ -2779,11 +3075,84 @@ TEMPLATES["admin_soal_edit.html"] = r'''{% extends "base.html" %}
 {% endblock %}
 '''
 
+TEMPLATES["admin_trash.html"] = r'''{% extends "base.html" %}
+{% block title %}Sampah Riwayat{% endblock %}
+{% block awidth %}max-w-6xl{% endblock %}
+{% block content %}
+<div class="flex flex-wrap items-end justify-between gap-3">
+  <div>
+    <h1 class="text-2xl font-bold">🗑️ Sampah Riwayat <span class="text-base font-normal text-slate-400">({{ total }})</span></h1>
+    <p class="mt-1 text-sm text-slate-500">Riwayat tes dan log aktivitas yang dihapus admin disimpan di sini selama <b>{{ days }} hari</b>, lalu hilang otomatis. Sebelum itu bisa dipulihkan.</p>
+  </div>
+  {% if total %}
+  <form method="post" action="/admin/sampah/kosongkan" onsubmit="var v = prompt('Ini menghapus PERMANEN semua isi Sampah ({{ total }} data). Ketik HAPUS untuk melanjutkan:'); if (v !== 'HAPUS') return false; this.ok.value = v; return true;">
+    <input type="hidden" name="ok" value=""><button class="btn btn-danger">Kosongkan Sampah</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if batches %}
+<h2 class="mb-2 mt-6 text-sm font-bold uppercase tracking-[.18em] text-slate-500">Penghapusan terakhir</h2>
+<div class="grid gap-3 md:grid-cols-2">
+  {% for b in batches %}
+  <div class="card flex flex-wrap items-center justify-between gap-3 p-4">
+    <div class="min-w-0">
+      <p class="font-semibold">{{ b.reason }}</p>
+      <p class="text-xs text-slate-400">{{ b.at[:16] }} · {{ b.c }} {{ 'tes' if b.kind == 'attempt' else 'log aktivitas' }}</p>
+    </div>
+    <form method="post" action="/admin/sampah/pulihkan-batch/{{ b.batch }}" onsubmit="return confirm('Pulihkan {{ b.c }} data dari penghapusan ini?')">
+      <button class="btn btn-primary !py-2">Pulihkan semua</button></form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<form method="get" class="card mt-6 flex flex-wrap gap-2 p-4">
+  <input name="q" value="{{ s }}" placeholder="Cari nama…" class="input !w-56">
+  <select name="kind" class="input !w-auto">
+    <option value="">Semua jenis</option>
+    <option value="attempt" {{ 'selected' if k == 'attempt' }}>Riwayat tes</option>
+    <option value="event" {{ 'selected' if k == 'event' }}>Log aktivitas</option>
+  </select>
+  <button class="btn btn-ghost">Filter</button>
+</form>
+
+<div class="card mt-4 overflow-hidden">
+  <div class="overflow-x-auto">
+  <table class="min-w-full divide-y divide-brand-50">
+    <thead class="bg-brand-50/60"><tr>
+      <th class="th">Dihapus</th><th class="th">Jenis</th><th class="th">Data</th><th class="th">Alasan</th><th class="th">Sisa waktu</th><th class="th text-right">Aksi</th>
+    </tr></thead>
+    <tbody class="divide-y divide-brand-50">
+      {% for t in items %}
+      <tr class="hover:bg-brand-50/50">
+        <td class="td whitespace-nowrap text-slate-500">{{ t.deleted }}</td>
+        <td class="td"><span class="pill {{ 'bg-brand-50 text-brand-700' if t.kind == 'attempt' else 'bg-slate-100 text-slate-600' }}">{{ 'Tes' if t.kind == 'attempt' else 'Aktivitas' }}</span></td>
+        <td class="td min-w-[240px]">{{ t.summ }}<span class="block text-xs text-slate-400">tanggal asli {{ t.when }}</span></td>
+        <td class="td text-slate-500">{{ t.reason }}</td>
+        <td class="td whitespace-nowrap"><span class="pill {{ 'bg-rose-100 text-rose-700' if t.left <= 3 else 'bg-slate-100 text-slate-600' }}">{{ t.left }} hari lagi</span></td>
+        <td class="td whitespace-nowrap text-right">
+          <form method="post" action="/admin/sampah/pulihkan/{{ t.id }}" class="inline"><button class="font-semibold text-brand-600 hover:underline">Pulihkan</button></form>
+          <form method="post" action="/admin/sampah/hapus/{{ t.id }}" class="ml-3 inline" onsubmit="return confirm('Hapus permanen data ini?')"><button class="font-semibold text-rose-600 hover:underline">Hapus permanen</button></form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="p-10 text-center text-slate-400">Sampah kosong.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% if more %}<p class="mt-2 text-xs text-slate-400">Menampilkan 300 data terbaru, {{ more }} lainnya tidak ditampilkan. Persempit dengan filter.</p>{% endif %}
+{% endblock %}
+'''
+
 app.jinja_loader = DictLoader(TEMPLATES)
 
 
 if __name__ == "__main__":
     from waitress import serve
+    purge_trash()
     if ADMIN_PASSWORD == "admin123":
         print("PERINGATAN: password admin masih default (admin123). Ganti segera, terutama jika diakses dari internet!")
     print(f"Aplikasi jalan. PC ini: http://localhost:{PORT}  |  Jaringan kantor: http://IP-PC-INI:{PORT}")
